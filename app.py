@@ -1,8 +1,8 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import requests
 from io import BytesIO
-from pathlib import Path
 
 # =========================
 # 기본 설정
@@ -13,19 +13,12 @@ st.set_page_config(
     layout="wide"
 )
 
-# Git 저장소 내부 기본 엑셀 경로
-# 예:
-# repo/
-#   app.py
-#   data/
-#       worklogs.xlsx
-DEFAULT_EXCEL_PATHS = [
-    Path("data/worklogs.xlsx"),
-    Path("worklogs.xlsx"),
-    Path("data/worklogs_20260316_054544.xlsx"),
-    Path("worklogs_20260316_054544.xlsx"),
-]
+# GitHub Raw 파일 주소
+# 예시:
+# https://raw.githubusercontent.com/사용자명/저장소명/main/worklogs.xlsx
+GITHUB_XLSX_URL = "https://raw.githubusercontent.com/kwon-juhwan/workslog/main/worklogs.xlsx"
 
+# 고정 컬럼: 이 컬럼을 제외한 나머지는 모두 '신규 품목 자동 인식'
 FIXED_COLS = [
     "업무일자",
     "이름",
@@ -51,6 +44,9 @@ def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def ensure_fixed_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    고정 컬럼이 없더라도 앱이 깨지지 않게 빈 컬럼 생성
+    """
     df = df.copy()
     for col in FIXED_COLS:
         if col not in df.columns:
@@ -71,6 +67,10 @@ def parse_dates(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def detect_product_cols(df: pd.DataFrame) -> list:
+    """
+    고정 컬럼을 제외한 나머지를 모두 품목 컬럼으로 간주
+    단, 완전히 빈 컬럼은 제외
+    """
     product_cols = []
     for col in df.columns:
         if col in FIXED_COLS:
@@ -82,6 +82,10 @@ def detect_product_cols(df: pd.DataFrame) -> list:
 
 
 def preprocess_product_values(df: pd.DataFrame, product_cols: list) -> pd.DataFrame:
+    """
+    품목 컬럼은 숫자로 변환
+    문자/공란/이상값은 0 처리
+    """
     df = df.copy()
     for col in product_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
@@ -89,6 +93,10 @@ def preprocess_product_values(df: pd.DataFrame, product_cols: list) -> pd.DataFr
 
 
 def make_long_dataframe(df: pd.DataFrame, product_cols: list) -> pd.DataFrame:
+    """
+    wide -> long 변환
+    품목명 / 수량 구조로 변환
+    """
     if not product_cols:
         return pd.DataFrame(columns=FIXED_COLS + ["품목명", "수량"])
 
@@ -118,8 +126,20 @@ def safe_contains(series: pd.Series, keyword: str) -> pd.Series:
     return series.fillna("").astype(str).str.contains(keyword, case=False, na=False)
 
 
-@st.cache_data
-def load_excel_from_bytes(file_bytes: bytes, sheet_name=0):
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_github_excel(url: str) -> bytes:
+    """
+    GitHub raw 주소에서 엑셀을 읽어옴
+    ttl=60 이므로 최대 60초 이내 자동 갱신
+    """
+    headers = {"Cache-Control": "no-cache"}
+    response = requests.get(url, headers=headers, timeout=30)
+    response.raise_for_status()
+    return response.content
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_excel(file_bytes: bytes, sheet_name=0):
     df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name)
     df = clean_columns(df)
     df = ensure_fixed_cols(df)
@@ -131,28 +151,6 @@ def load_excel_from_bytes(file_bytes: bytes, sheet_name=0):
     long_df = make_long_dataframe(df, product_cols)
 
     return df, long_df, product_cols
-
-
-@st.cache_data
-def load_excel_from_path(file_path: str, sheet_name=0):
-    df = pd.read_excel(file_path, sheet_name=sheet_name)
-    df = clean_columns(df)
-    df = ensure_fixed_cols(df)
-    df = parse_dates(df)
-
-    product_cols = detect_product_cols(df)
-    df = preprocess_product_values(df, product_cols)
-    df = add_total_qty(df, product_cols)
-    long_df = make_long_dataframe(df, product_cols)
-
-    return df, long_df, product_cols
-
-
-def find_default_excel():
-    for path in DEFAULT_EXCEL_PATHS:
-        if path.exists():
-            return path
-    return None
 
 
 def apply_filters(df: pd.DataFrame, long_df: pd.DataFrame):
@@ -283,50 +281,54 @@ def make_download_file(df: pd.DataFrame) -> bytes:
 # UI
 # =========================
 st.title("📊 업무일지 / 생산 대시보드")
-st.caption("고정 컬럼 외 나머지 컬럼은 모두 자동으로 생산 품목으로 인식합니다.")
-
-default_file = find_default_excel()
+st.caption("GitHub의 worklogs.xlsx를 자동으로 읽습니다. 고정 컬럼 외 나머지 컬럼은 모두 자동으로 생산 품목으로 인식합니다.")
 
 with st.sidebar:
-    st.header("데이터 불러오기 방식")
-    use_uploaded_file = st.checkbox("업로드 파일 우선 사용", value=False)
+    st.subheader("데이터 설정")
+    github_url = st.text_input("GitHub Raw Excel URL", value=GITHUB_XLSX_URL)
+    st.caption("반드시 raw.githubusercontent.com 주소를 넣어야 합니다.")
+    col_a, col_b = st.columns(2)
+    with col_a:
+        refresh_clicked = st.button("새로고침")
+    with col_b:
+        show_manual_upload = st.checkbox("수동 업로드 사용", value=False)
 
-uploaded_file = None
-source_label = ""
+if refresh_clicked:
+    fetch_github_excel.clear()
+    load_excel.clear()
+    st.cache_data.clear()
 
-if use_uploaded_file:
+if show_manual_upload:
     uploaded_file = st.file_uploader("엑셀 파일 업로드", type=["xlsx", "xls"])
-
-try:
-    if use_uploaded_file and uploaded_file is not None:
-        file_bytes = uploaded_file.read()
-        df, long_df, product_cols = load_excel_from_bytes(file_bytes)
-        source_label = f"업로드 파일: {uploaded_file.name}"
-
-    elif default_file is not None:
-        df, long_df, product_cols = load_excel_from_path(str(default_file))
-        source_label = f"Git 저장소 파일: {default_file}"
-
-    elif uploaded_file is not None:
-        file_bytes = uploaded_file.read()
-        df, long_df, product_cols = load_excel_from_bytes(file_bytes)
-        source_label = f"업로드 파일: {uploaded_file.name}"
-
-    else:
-        st.info("Git 저장소에 기본 엑셀 파일이 없거나 업로드된 파일이 없습니다.")
-        st.info("`data/worklogs.xlsx` 또는 `worklogs.xlsx` 파일을 저장소에 넣어주세요.")
+    if uploaded_file is None:
+        st.info("엑셀 파일을 업로드하면 대시보드가 표시됩니다.")
+        st.stop()
+    file_bytes = uploaded_file.read()
+    data_source_label = "수동 업로드 파일"
+else:
+    if "raw.githubusercontent.com" not in github_url:
+        st.error("GitHub 일반 주소가 아니라 raw 주소를 넣어야 합니다.")
         st.stop()
 
+    try:
+        file_bytes = fetch_github_excel(github_url)
+        data_source_label = "GitHub worklogs.xlsx"
+    except Exception as e:
+        st.error(f"GitHub에서 엑셀을 읽는 중 오류가 발생했습니다: {e}")
+        st.stop()
+
+try:
+    df, long_df, product_cols = load_excel(file_bytes)
 except Exception as e:
-    st.error(f"파일을 읽는 중 오류가 발생했습니다: {e}")
+    st.error(f"엑셀 파싱 중 오류가 발생했습니다: {e}")
     st.stop()
 
 if df.empty:
     st.warning("데이터가 비어 있습니다.")
     st.stop()
 
-st.success(f"{source_label}")
-st.success(f"불러온 데이터: {len(df):,}건 / 자동 인식된 품목 수: {len(product_cols):,}개")
+st.success(f"데이터 원본: {data_source_label} / 불러온 데이터: {len(df):,}건 / 자동 인식된 품목 수: {len(product_cols):,}개")
+st.caption("GitHub 파일 변경 후 최대 60초 이내에 자동 반영됩니다. 바로 반영이 필요하면 '새로고침' 버튼을 누르세요.")
 
 with st.expander("자동 인식된 품목 컬럼 보기"):
     if product_cols:
@@ -346,10 +348,12 @@ total_qty = int(filtered_long_df["수량"].sum()) if not filtered_long_df.empty 
 
 issue_count = 0
 if "특이사항" in filtered_df.columns and "코멘트" in filtered_df.columns:
-    issue_count = int((
-        filtered_df["특이사항"].fillna("").astype(str).str.strip().ne("") |
-        filtered_df["코멘트"].fillna("").astype(str).str.strip().ne("")
-    ).sum())
+    issue_count = int(
+        (
+            filtered_df["특이사항"].fillna("").astype(str).str.strip().ne("") |
+            filtered_df["코멘트"].fillna("").astype(str).str.strip().ne("")
+        ).sum()
+    )
 
 c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("업무일지 건수", f"{total_logs:,}")
@@ -358,10 +362,16 @@ c3.metric("품목 수", f"{total_products:,}")
 c4.metric("총 생산수량", f"{total_qty:,}")
 c5.metric("이슈 건수", f"{issue_count:,}")
 
+# =========================
+# 탭
+# =========================
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "Overview", "생산현황", "업무일지", "이슈관리", "원본데이터"
 ])
 
+# =========================
+# 1) Overview
+# =========================
 with tab1:
     left, right = st.columns([1.2, 1])
 
@@ -423,6 +433,9 @@ with tab1:
         else:
             st.info("표시할 데이터가 없습니다.")
 
+# =========================
+# 2) 생산현황
+# =========================
 with tab2:
     st.subheader("품목별 생산량 상세")
 
@@ -470,6 +483,9 @@ with tab2:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
+# =========================
+# 3) 업무일지
+# =========================
 with tab3:
     st.subheader("업무일지 상세")
 
@@ -495,6 +511,9 @@ with tab3:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
+# =========================
+# 4) 이슈관리
+# =========================
 with tab4:
     st.subheader("특이사항 / 코멘트 관리")
 
@@ -531,6 +550,9 @@ with tab4:
         st.write("**이슈 요약**")
         st.dataframe(issue_summary, use_container_width=True, hide_index=True)
 
+# =========================
+# 5) 원본데이터
+# =========================
 with tab5:
     st.subheader("원본 데이터")
     st.dataframe(filtered_df, use_container_width=True, hide_index=True, height=600)
