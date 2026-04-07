@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import requests
 from io import BytesIO
 
 # =========================
@@ -12,8 +13,11 @@ st.set_page_config(
     layout="wide"
 )
 
-# 고정 컬럼
-FIXED_COLS = [
+# GitHub Raw 파일 주소
+GITHUB_XLSX_URL = "https://raw.githubusercontent.com/kwon-juhwan/workslog/main/worklogs.xlsx"
+
+# 고정 컬럼 후보
+BASE_FIXED_COLS = [
     "업무일자",
     "이름",
     "부서",
@@ -25,28 +29,32 @@ FIXED_COLS = [
     "배송이슈",
     "오전 업무내용",
     "오후 업무내용",
+    "오전업무",
+    "오후업무",
     "미처리내역",
     "예정사항",
     "특이사항",
     "Comment",
+    "코멘트",
 ]
 
-TEXT_COLS = [
+TEXT_COL_CANDIDATES = [
     "재고확인사항",
     "배송이슈",
     "오전 업무내용",
     "오후 업무내용",
+    "오전업무",
+    "오후업무",
     "미처리내역",
     "예정사항",
     "특이사항",
     "Comment",
+    "코멘트",
 ]
-
-DATE_COLS = ["업무일자", "작성일시"]
 
 
 # =========================
-# 공통 함수
+# 공통 유틸
 # =========================
 def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -54,9 +62,51 @@ def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def unify_column_aliases(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    서로 다른 컬럼명을 하나로 정리
+    """
+    df = df.copy()
+
+    alias_map = {
+        "오전업무": "오전 업무내용",
+        "오후업무": "오후 업무내용",
+        "코멘트": "Comment",
+    }
+
+    for old_col, new_col in alias_map.items():
+        if old_col in df.columns:
+            if new_col in df.columns:
+                # 둘 다 있으면 old_col 값으로 new_col 빈값 보완 후 old_col 제거
+                df[new_col] = df[new_col].where(
+                    df[new_col].notna() & (df[new_col].astype(str).str.strip() != ""),
+                    df[old_col]
+                )
+                df.drop(columns=[old_col], inplace=True)
+            else:
+                df.rename(columns={old_col: new_col}, inplace=True)
+
+    return df
+
+
+def get_fixed_cols(df: pd.DataFrame) -> list:
+    return [c for c in BASE_FIXED_COLS if c in df.columns]
+
+
+def get_text_cols(df: pd.DataFrame) -> list:
+    return [c for c in TEXT_COL_CANDIDATES if c in df.columns]
+
+
 def ensure_fixed_cols(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    for col in FIXED_COLS:
+    required_cols = [
+        "업무일자", "이름", "부서", "작성일시",
+        "입고수량", "출고수량", "반품수량",
+        "재고확인사항", "배송이슈",
+        "오전 업무내용", "오후 업무내용",
+        "미처리내역", "예정사항", "특이사항", "Comment"
+    ]
+    for col in required_cols:
         if col not in df.columns:
             df[col] = np.nan
     return df
@@ -75,24 +125,20 @@ def parse_dates(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def detect_product_cols(df: pd.DataFrame) -> list:
-    """
-    고정 컬럼 제외 나머지를 품목 컬럼으로 간주
-    단, 완전히 빈 컬럼은 제외
-    """
+    fixed_cols = set(get_fixed_cols(df))
     product_cols = []
+
     for col in df.columns:
-        if col in FIXED_COLS:
+        if col in fixed_cols:
             continue
         if df[col].isna().all():
             continue
         product_cols.append(col)
+
     return product_cols
 
 
 def preprocess_numeric_cols(df: pd.DataFrame, product_cols: list) -> pd.DataFrame:
-    """
-    수량성 컬럼 숫자 변환
-    """
     df = df.copy()
 
     qty_cols = ["입고수량", "출고수량", "반품수량"] + product_cols
@@ -105,19 +151,15 @@ def preprocess_numeric_cols(df: pd.DataFrame, product_cols: list) -> pd.DataFram
 
 
 def make_long_dataframe(df: pd.DataFrame, product_cols: list) -> pd.DataFrame:
-    """
-    wide -> long 변환
-    """
     if not product_cols:
-        return pd.DataFrame(columns=FIXED_COLS + ["품목명", "수량"])
+        return pd.DataFrame(columns=get_fixed_cols(df) + ["품목명", "수량"])
 
     long_df = df.melt(
-        id_vars=[c for c in FIXED_COLS if c in df.columns],
+        id_vars=get_fixed_cols(df),
         value_vars=product_cols,
         var_name="품목명",
         value_name="수량"
     )
-
     long_df["수량"] = pd.to_numeric(long_df["수량"], errors="coerce").fillna(0)
     long_df = long_df[long_df["수량"] > 0].copy()
     return long_df
@@ -138,10 +180,41 @@ def safe_contains(series: pd.Series, keyword: str) -> pd.Series:
     return series.fillna("").astype(str).str.contains(keyword, case=False, na=False)
 
 
-@st.cache_data
+def build_keyword_mask(df: pd.DataFrame, keyword: str) -> pd.Series:
+    text_cols = get_text_cols(df)
+    if not text_cols:
+        return pd.Series([True] * len(df), index=df.index)
+
+    mask = pd.Series([False] * len(df), index=df.index)
+    for col in text_cols:
+        mask = mask | safe_contains(df[col], keyword)
+    return mask
+
+
+def build_issue_mask(df: pd.DataFrame) -> pd.Series:
+    issue_cols = [c for c in ["재고확인사항", "배송이슈", "미처리내역", "특이사항", "Comment"] if c in df.columns]
+    if not issue_cols:
+        return pd.Series([False] * len(df), index=df.index)
+
+    mask = pd.Series([False] * len(df), index=df.index)
+    for col in issue_cols:
+        mask = mask | df[col].fillna("").astype(str).str.strip().ne("")
+    return mask
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_github_excel(url: str) -> bytes:
+    headers = {"Cache-Control": "no-cache"}
+    response = requests.get(url, headers=headers, timeout=30)
+    response.raise_for_status()
+    return response.content
+
+
+@st.cache_data(ttl=60, show_spinner=False)
 def load_excel(file_bytes: bytes, sheet_name=0):
     df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name)
     df = clean_columns(df)
+    df = unify_column_aliases(df)
     df = ensure_fixed_cols(df)
     df = parse_dates(df)
 
@@ -186,7 +259,6 @@ def apply_filters(df: pd.DataFrame, long_df: pd.DataFrame):
     selected_products = st.sidebar.multiselect("품목", products, default=products)
 
     keyword = st.sidebar.text_input("업무/이슈 키워드 검색", "")
-
     issue_only = st.sidebar.checkbox("이슈 있는 건만 보기", value=False)
 
     filtered_df = df.copy()
@@ -203,27 +275,10 @@ def apply_filters(df: pd.DataFrame, long_df: pd.DataFrame):
         filtered_df = filtered_df[filtered_df["부서"].astype(str).isin(selected_depts)]
 
     if keyword.strip():
-        keyword_mask = (
-            safe_contains(filtered_df["재고확인사항"], keyword) |
-            safe_contains(filtered_df["배송이슈"], keyword) |
-            safe_contains(filtered_df["오전 업무내용"], keyword) |
-            safe_contains(filtered_df["오후 업무내용"], keyword) |
-            safe_contains(filtered_df["미처리내역"], keyword) |
-            safe_contains(filtered_df["예정사항"], keyword) |
-            safe_contains(filtered_df["특이사항"], keyword) |
-            safe_contains(filtered_df["Comment"], keyword)
-        )
-        filtered_df = filtered_df[keyword_mask]
+        filtered_df = filtered_df[build_keyword_mask(filtered_df, keyword)]
 
     if issue_only:
-        issue_mask = (
-            filtered_df["재고확인사항"].fillna("").astype(str).str.strip().ne("") |
-            filtered_df["배송이슈"].fillna("").astype(str).str.strip().ne("") |
-            filtered_df["미처리내역"].fillna("").astype(str).str.strip().ne("") |
-            filtered_df["특이사항"].fillna("").astype(str).str.strip().ne("") |
-            filtered_df["Comment"].fillna("").astype(str).str.strip().ne("")
-        )
-        filtered_df = filtered_df[issue_mask]
+        filtered_df = filtered_df[build_issue_mask(filtered_df)]
 
     filtered_long_df = long_df.copy()
 
@@ -242,31 +297,14 @@ def apply_filters(df: pd.DataFrame, long_df: pd.DataFrame):
         filtered_long_df = filtered_long_df[filtered_long_df["품목명"].astype(str).isin(selected_products)]
 
     if keyword.strip():
-        keyword_mask_long = (
-            safe_contains(filtered_long_df["재고확인사항"], keyword) |
-            safe_contains(filtered_long_df["배송이슈"], keyword) |
-            safe_contains(filtered_long_df["오전 업무내용"], keyword) |
-            safe_contains(filtered_long_df["오후 업무내용"], keyword) |
-            safe_contains(filtered_long_df["미처리내역"], keyword) |
-            safe_contains(filtered_long_df["예정사항"], keyword) |
-            safe_contains(filtered_long_df["특이사항"], keyword) |
-            safe_contains(filtered_long_df["Comment"], keyword)
-        )
-        filtered_long_df = filtered_long_df[keyword_mask_long]
+        filtered_long_df = filtered_long_df[build_keyword_mask(filtered_long_df, keyword)]
 
     if issue_only:
-        issue_mask_long = (
-            filtered_long_df["재고확인사항"].fillna("").astype(str).str.strip().ne("") |
-            filtered_long_df["배송이슈"].fillna("").astype(str).str.strip().ne("") |
-            filtered_long_df["미처리내역"].fillna("").astype(str).str.strip().ne("") |
-            filtered_long_df["특이사항"].fillna("").astype(str).str.strip().ne("") |
-            filtered_long_df["Comment"].fillna("").astype(str).str.strip().ne("")
-        )
-        filtered_long_df = filtered_long_df[issue_mask_long]
+        filtered_long_df = filtered_long_df[build_issue_mask(filtered_long_df)]
 
-    # 선택한 품목 기준으로 총생산수량 재계산
+    # 선택 품목 기준 총생산수량 재계산
     if selected_products:
-        group_cols = [c for c in FIXED_COLS if c in filtered_long_df.columns]
+        group_cols = [c for c in get_fixed_cols(filtered_long_df) if c in filtered_long_df.columns]
 
         selected_sum_df = (
             filtered_long_df.groupby(group_cols, dropna=False)["수량"]
@@ -312,11 +350,7 @@ def compute_staffing_kpis(filtered_df: pd.DataFrame, filtered_long_df: pd.DataFr
     active_people = filtered_df["이름"].dropna().astype(str).nunique() if "이름" in filtered_df.columns else 0
 
     if "업무일자" in filtered_df.columns and "이름" in filtered_df.columns:
-        worker_days = (
-            filtered_df.groupby("업무일자")["이름"]
-            .nunique()
-            .sum()
-        )
+        worker_days = filtered_df.groupby("업무일자")["이름"].nunique().sum()
     else:
         worker_days = 0
 
@@ -336,11 +370,7 @@ def compute_staffing_kpis(filtered_df: pd.DataFrame, filtered_long_df: pd.DataFr
             recent_total_qty = int(recent_long_df["수량"].sum()) if not recent_long_df.empty else 0
 
             if not recent_df.empty and "이름" in recent_df.columns:
-                recent_worker_days = (
-                    recent_df.groupby("업무일자")["이름"]
-                    .nunique()
-                    .sum()
-                )
+                recent_worker_days = recent_df.groupby("업무일자")["이름"].nunique().sum()
             else:
                 recent_worker_days = 0
 
@@ -367,26 +397,56 @@ def compute_staffing_kpis(filtered_df: pd.DataFrame, filtered_long_df: pd.DataFr
 # UI
 # =========================
 st.title("📊 업무일지 / 생산 대시보드")
-st.caption("고정 컬럼 외 나머지 컬럼은 모두 자동으로 생산 품목으로 인식합니다.")
+st.caption("GitHub의 worklogs.xlsx를 자동으로 읽습니다. 고정 컬럼 외 나머지 컬럼은 모두 자동으로 생산 품목으로 인식합니다.")
 
-uploaded_file = st.file_uploader("엑셀 파일 업로드", type=["xlsx", "xls"])
+with st.sidebar:
+    st.header("데이터 불러오기 방식")
+    github_url = st.text_input("GitHub Raw Excel URL", value=GITHUB_XLSX_URL)
+    st.caption("반드시 raw.githubusercontent.com 주소를 넣어야 합니다.")
+    col_a, col_b = st.columns(2)
+    with col_a:
+        refresh_clicked = st.button("새로고침")
+    with col_b:
+        show_manual_upload = st.checkbox("수동 업로드 사용", value=False)
 
-if uploaded_file is None:
-    st.info("엑셀 파일을 업로드하면 대시보드가 표시됩니다.")
-    st.stop()
+uploaded_file = None
+
+if refresh_clicked:
+    fetch_github_excel.clear()
+    load_excel.clear()
+    st.cache_data.clear()
+
+if show_manual_upload:
+    uploaded_file = st.file_uploader("엑셀 파일 업로드", type=["xlsx", "xls"])
+    if uploaded_file is None:
+        st.info("엑셀 파일을 업로드하면 대시보드가 표시됩니다.")
+        st.stop()
+    file_bytes = uploaded_file.read()
+    data_source_label = f"수동 업로드 파일: {uploaded_file.name}"
+else:
+    if "raw.githubusercontent.com" not in github_url:
+        st.error("GitHub 일반 주소가 아니라 raw 주소를 넣어야 합니다.")
+        st.stop()
+
+    try:
+        file_bytes = fetch_github_excel(github_url)
+        data_source_label = "GitHub worklogs.xlsx"
+    except Exception as e:
+        st.error(f"GitHub에서 엑셀을 읽는 중 오류가 발생했습니다: {e}")
+        st.stop()
 
 try:
-    file_bytes = uploaded_file.read()
     df, long_df, product_cols = load_excel(file_bytes)
 except Exception as e:
-    st.error(f"파일을 읽는 중 오류가 발생했습니다: {e}")
+    st.error(f"엑셀 파싱 중 오류가 발생했습니다: {e}")
     st.stop()
 
 if df.empty:
     st.warning("데이터가 비어 있습니다.")
     st.stop()
 
-st.success(f"불러온 데이터: {len(df):,}건 / 자동 인식된 품목 수: {len(product_cols):,}개")
+st.success(f"데이터 원본: {data_source_label} / 불러온 데이터: {len(df):,}건 / 자동 인식된 품목 수: {len(product_cols):,}개")
+st.caption("GitHub 파일 변경 후 최대 60초 이내에 자동 반영됩니다. 바로 반영이 필요하면 '새로고침' 버튼을 누르세요.")
 
 with st.expander("자동 인식된 품목 컬럼 보기"):
     if product_cols:
@@ -409,16 +469,7 @@ target_daily_qty = st.sidebar.number_input(
 )
 
 kpis = compute_staffing_kpis(filtered_df, filtered_long_df, target_daily_qty)
-
-issue_count = 0
-if not filtered_df.empty:
-    issue_count = int((
-        filtered_df["재고확인사항"].fillna("").astype(str).str.strip().ne("") |
-        filtered_df["배송이슈"].fillna("").astype(str).str.strip().ne("") |
-        filtered_df["미처리내역"].fillna("").astype(str).str.strip().ne("") |
-        filtered_df["특이사항"].fillna("").astype(str).str.strip().ne("") |
-        filtered_df["Comment"].fillna("").astype(str).str.strip().ne("")
-    ).sum())
+issue_count = int(build_issue_mask(filtered_df).sum()) if not filtered_df.empty else 0
 
 c1, c2, c3, c4, c5, c6 = st.columns(6)
 c1.metric("총 생산수량", f"{kpis['총 생산수량']:,}")
@@ -674,14 +725,7 @@ with tab5:
     st.subheader("이슈 관리")
 
     issues = filtered_df.copy()
-    issue_mask = (
-        issues["재고확인사항"].fillna("").astype(str).str.strip().ne("") |
-        issues["배송이슈"].fillna("").astype(str).str.strip().ne("") |
-        issues["미처리내역"].fillna("").astype(str).str.strip().ne("") |
-        issues["특이사항"].fillna("").astype(str).str.strip().ne("") |
-        issues["Comment"].fillna("").astype(str).str.strip().ne("")
-    )
-    issues = issues[issue_mask].copy()
+    issues = issues[build_issue_mask(issues)].copy()
 
     issue_cols = [
         c for c in [
@@ -706,20 +750,27 @@ with tab5:
             height=600
         )
 
+        multi_issue_count = 0
+        issue_check_cols = [c for c in ["재고확인사항", "배송이슈", "미처리내역", "특이사항", "Comment"] if c in issues.columns]
+        if issue_check_cols:
+            multi_issue_count = int(
+                issues[issue_check_cols]
+                .fillna("")
+                .astype(str)
+                .apply(lambda row: sum(x.strip() != "" for x in row), axis=1)
+                .ge(2)
+                .sum()
+            )
+
         issue_summary = pd.DataFrame({
             "구분": ["재고확인사항", "배송이슈", "미처리내역", "특이사항", "Comment", "2개 이상 이슈"],
             "건수": [
-                int(issues["재고확인사항"].fillna("").astype(str).str.strip().ne("").sum()),
-                int(issues["배송이슈"].fillna("").astype(str).str.strip().ne("").sum()),
-                int(issues["미처리내역"].fillna("").astype(str).str.strip().ne("").sum()),
-                int(issues["특이사항"].fillna("").astype(str).str.strip().ne("").sum()),
-                int(issues["Comment"].fillna("").astype(str).str.strip().ne("").sum()),
-                int((
-                    issues[["재고확인사항", "배송이슈", "미처리내역", "특이사항", "Comment"]]
-                    .fillna("")
-                    .astype(str)
-                    .apply(lambda row: sum(x.strip() != "" for x in row), axis=1) >= 2
-                ).sum())
+                int(issues["재고확인사항"].fillna("").astype(str).str.strip().ne("").sum()) if "재고확인사항" in issues.columns else 0,
+                int(issues["배송이슈"].fillna("").astype(str).str.strip().ne("").sum()) if "배송이슈" in issues.columns else 0,
+                int(issues["미처리내역"].fillna("").astype(str).str.strip().ne("").sum()) if "미처리내역" in issues.columns else 0,
+                int(issues["특이사항"].fillna("").astype(str).str.strip().ne("").sum()) if "특이사항" in issues.columns else 0,
+                int(issues["Comment"].fillna("").astype(str).str.strip().ne("").sum()) if "Comment" in issues.columns else 0,
+                multi_issue_count
             ]
         })
 
