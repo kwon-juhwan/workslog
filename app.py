@@ -77,7 +77,6 @@ def unify_column_aliases(df: pd.DataFrame) -> pd.DataFrame:
     for old_col, new_col in alias_map.items():
         if old_col in df.columns:
             if new_col in df.columns:
-                # 둘 다 있으면 old_col 값으로 new_col 빈값 보완 후 old_col 제거
                 df[new_col] = df[new_col].where(
                     df[new_col].notna() & (df[new_col].astype(str).str.strip() != ""),
                     df[old_col]
@@ -116,7 +115,9 @@ def parse_dates(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
     if "업무일자" in df.columns:
-        df["업무일자"] = pd.to_datetime(df["업무일자"], errors="coerce").dt.date
+        dt = pd.to_datetime(df["업무일자"], errors="coerce")
+        df["업무일자"] = dt.dt.date
+        df["업무분기"] = dt.dt.to_period("Q").astype(str)
 
     if "작성일시" in df.columns:
         df["작성일시"] = pd.to_datetime(df["작성일시"], errors="coerce")
@@ -125,7 +126,7 @@ def parse_dates(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def detect_product_cols(df: pd.DataFrame) -> list:
-    fixed_cols = set(get_fixed_cols(df))
+    fixed_cols = set(get_fixed_cols(df)) | {"업무분기", "총생산수량"}
     product_cols = []
 
     for col in df.columns:
@@ -152,10 +153,14 @@ def preprocess_numeric_cols(df: pd.DataFrame, product_cols: list) -> pd.DataFram
 
 def make_long_dataframe(df: pd.DataFrame, product_cols: list) -> pd.DataFrame:
     if not product_cols:
-        return pd.DataFrame(columns=get_fixed_cols(df) + ["품목명", "수량"])
+        return pd.DataFrame(columns=get_fixed_cols(df) + ["업무분기", "품목명", "수량"])
+
+    id_vars = get_fixed_cols(df)
+    if "업무분기" in df.columns:
+        id_vars = id_vars + ["업무분기"]
 
     long_df = df.melt(
-        id_vars=get_fixed_cols(df),
+        id_vars=id_vars,
         value_vars=product_cols,
         var_name="품목명",
         value_name="수량"
@@ -200,6 +205,16 @@ def build_issue_mask(df: pd.DataFrame) -> pd.Series:
     for col in issue_cols:
         mask = mask | df[col].fillna("").astype(str).str.strip().ne("")
     return mask
+
+
+def sort_quarter_strings(values):
+    def quarter_key(q):
+        try:
+            y, qq = q.split("Q")
+            return (int(y), int(qq))
+        except:
+            return (9999, 9)
+    return sorted(values, key=quarter_key)
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -305,6 +320,8 @@ def apply_filters(df: pd.DataFrame, long_df: pd.DataFrame):
     # 선택 품목 기준 총생산수량 재계산
     if selected_products:
         group_cols = [c for c in get_fixed_cols(filtered_long_df) if c in filtered_long_df.columns]
+        if "업무분기" in filtered_long_df.columns:
+            group_cols = group_cols + ["업무분기"]
 
         selected_sum_df = (
             filtered_long_df.groupby(group_cols, dropna=False)["수량"]
@@ -332,16 +349,13 @@ def make_download_file(df: pd.DataFrame) -> bytes:
     return output.getvalue()
 
 
-def compute_staffing_kpis(filtered_df: pd.DataFrame, filtered_long_df: pd.DataFrame, target_daily_qty: int):
+def compute_basic_kpis(filtered_df: pd.DataFrame, filtered_long_df: pd.DataFrame):
     if filtered_df.empty:
         return {
             "총 생산수량": 0,
-            "일평균 생산수량": 0,
+            "작업일수": 0,
             "투입 인원수": 0,
             "1인당 일평균 생산량": 0,
-            "최근7일 1인당 생산량": 0,
-            "예상 필요 인원": 0,
-            "작업일수": 0,
             "worker_days": 0,
         }
 
@@ -354,42 +368,113 @@ def compute_staffing_kpis(filtered_df: pd.DataFrame, filtered_long_df: pd.DataFr
     else:
         worker_days = 0
 
-    daily_avg_qty = round(total_qty / work_days, 2) if work_days > 0 else 0
     per_person_day_avg = round(total_qty / worker_days, 2) if worker_days > 0 else 0
-
-    recent_per_person_day_avg = 0
-    if not filtered_df.empty and "업무일자" in filtered_df.columns:
-        max_date = filtered_df["업무일자"].max()
-        if pd.notna(max_date):
-            recent_start = pd.to_datetime(max_date) - pd.Timedelta(days=6)
-            recent_start = recent_start.date()
-
-            recent_df = filtered_df[filtered_df["업무일자"] >= recent_start].copy()
-            recent_long_df = filtered_long_df[filtered_long_df["업무일자"] >= recent_start].copy()
-
-            recent_total_qty = int(recent_long_df["수량"].sum()) if not recent_long_df.empty else 0
-
-            if not recent_df.empty and "이름" in recent_df.columns:
-                recent_worker_days = recent_df.groupby("업무일자")["이름"].nunique().sum()
-            else:
-                recent_worker_days = 0
-
-            recent_per_person_day_avg = round(
-                recent_total_qty / recent_worker_days, 2
-            ) if recent_worker_days > 0 else 0
-
-    base_productivity = recent_per_person_day_avg if recent_per_person_day_avg > 0 else per_person_day_avg
-    required_headcount = int(np.ceil(target_daily_qty / base_productivity)) if base_productivity > 0 else 0
 
     return {
         "총 생산수량": total_qty,
-        "일평균 생산수량": daily_avg_qty,
+        "작업일수": work_days,
         "투입 인원수": active_people,
         "1인당 일평균 생산량": per_person_day_avg,
-        "최근7일 1인당 생산량": recent_per_person_day_avg,
-        "예상 필요 인원": required_headcount,
-        "작업일수": work_days,
         "worker_days": worker_days,
+    }
+
+
+def compute_quarter_staffing_kpis(filtered_df: pd.DataFrame, filtered_long_df: pd.DataFrame):
+    """
+    방법 B:
+    추가 필요 인원 = 전분기 대비 증가분 / 전분기 1인당 분기 처리량
+    """
+    empty_result = {
+        "quarter_summary": pd.DataFrame(),
+        "current_quarter": None,
+        "prev_quarter": None,
+        "current_qty": 0,
+        "prev_qty": 0,
+        "increase_qty": 0,
+        "growth_rate": 0,
+        "prev_avg_headcount": 0,
+        "prev_per_person_quarter_qty": 0,
+        "extra_headcount_needed": 0,
+        "current_avg_headcount": 0,
+    }
+
+    if filtered_df.empty or filtered_long_df.empty:
+        return empty_result
+
+    if "업무분기" not in filtered_df.columns or "업무분기" not in filtered_long_df.columns:
+        return empty_result
+
+    quarter_qty = (
+        filtered_long_df.groupby("업무분기", dropna=False)["수량"]
+        .sum()
+        .reset_index()
+        .rename(columns={"수량": "분기총생산량"})
+    )
+
+    daily_headcount = (
+        filtered_df.groupby(["업무분기", "업무일자"], dropna=False)["이름"]
+        .nunique()
+        .reset_index()
+        .rename(columns={"이름": "일투입인원"})
+    )
+
+    quarter_headcount = (
+        daily_headcount.groupby("업무분기", dropna=False)["일투입인원"]
+        .mean()
+        .reset_index()
+        .rename(columns={"일투입인원": "평균투입인원"})
+    )
+
+    quarter_summary = quarter_qty.merge(quarter_headcount, on="업무분기", how="left")
+    quarter_summary["평균투입인원"] = quarter_summary["평균투입인원"].fillna(0)
+    quarter_summary["1인당분기처리량"] = quarter_summary.apply(
+        lambda x: round(x["분기총생산량"] / x["평균투입인원"], 2) if x["평균투입인원"] > 0 else 0,
+        axis=1
+    )
+
+    quarter_summary["정렬키"] = quarter_summary["업무분기"].apply(
+        lambda x: pd.Period(x, freq="Q") if pd.notna(x) and str(x) != "nan" else pd.NaT
+    )
+    quarter_summary = quarter_summary.sort_values("정렬키").reset_index(drop=True)
+
+    if len(quarter_summary) < 2:
+        quarter_summary = quarter_summary.drop(columns=["정렬키"], errors="ignore")
+        return {
+            **empty_result,
+            "quarter_summary": quarter_summary
+        }
+
+    prev_row = quarter_summary.iloc[-2]
+    curr_row = quarter_summary.iloc[-1]
+
+    prev_qty = float(prev_row["분기총생산량"])
+    current_qty = float(curr_row["분기총생산량"])
+    increase_qty = current_qty - prev_qty
+    growth_rate = round((increase_qty / prev_qty) * 100, 2) if prev_qty > 0 else 0
+
+    prev_avg_headcount = float(prev_row["평균투입인원"])
+    current_avg_headcount = float(curr_row["평균투입인원"])
+    prev_per_person_quarter_qty = float(prev_row["1인당분기처리량"])
+
+    if increase_qty > 0 and prev_per_person_quarter_qty > 0:
+        extra_headcount_needed = int(np.ceil(increase_qty / prev_per_person_quarter_qty))
+    else:
+        extra_headcount_needed = 0
+
+    quarter_summary = quarter_summary.drop(columns=["정렬키"], errors="ignore")
+
+    return {
+        "quarter_summary": quarter_summary,
+        "current_quarter": curr_row["업무분기"],
+        "prev_quarter": prev_row["업무분기"],
+        "current_qty": int(current_qty),
+        "prev_qty": int(prev_qty),
+        "increase_qty": int(increase_qty),
+        "growth_rate": growth_rate,
+        "prev_avg_headcount": round(prev_avg_headcount, 2),
+        "prev_per_person_quarter_qty": round(prev_per_person_quarter_qty, 2),
+        "extra_headcount_needed": extra_headcount_needed,
+        "current_avg_headcount": round(current_avg_headcount, 2),
     }
 
 
@@ -459,28 +544,31 @@ filtered_df, filtered_long_df = apply_filters(df, long_df)
 # =========================
 # KPI
 # =========================
-st.sidebar.markdown("---")
-st.sidebar.subheader("충원 판단 기준")
-target_daily_qty = st.sidebar.number_input(
-    "목표 일생산량",
-    min_value=0,
-    value=300,
-    step=10
-)
-
-kpis = compute_staffing_kpis(filtered_df, filtered_long_df, target_daily_qty)
+basic_kpis = compute_basic_kpis(filtered_df, filtered_long_df)
+quarter_kpis = compute_quarter_staffing_kpis(filtered_df, filtered_long_df)
 issue_count = int(build_issue_mask(filtered_df).sum()) if not filtered_df.empty else 0
 
 c1, c2, c3, c4, c5, c6 = st.columns(6)
-c1.metric("총 생산수량", f"{kpis['총 생산수량']:,}")
-c2.metric("일평균 생산수량", f"{kpis['일평균 생산수량']:,}")
-c3.metric("투입 인원수", f"{kpis['투입 인원수']:,}")
-c4.metric("1인당 일평균 생산량", f"{kpis['1인당 일평균 생산량']:,}")
-c5.metric("최근7일 1인당 생산량", f"{kpis['최근7일 1인당 생산량']:,}")
-c6.metric("예상 필요 인원", f"{kpis['예상 필요 인원']:,}명")
+c1.metric("총 생산수량", f"{basic_kpis['총 생산수량']:,}")
+c2.metric("작업일수", f"{basic_kpis['작업일수']:,}")
+c3.metric("투입 인원수", f"{basic_kpis['투입 인원수']:,}")
+c4.metric("1인당 일평균 생산량", f"{basic_kpis['1인당 일평균 생산량']:,}")
+
+if quarter_kpis["prev_quarter"] and quarter_kpis["current_quarter"]:
+    c5.metric(
+        "전분기 대비 증감률",
+        f"{quarter_kpis['growth_rate']:,}%"
+    )
+    c6.metric(
+        "추가 필요 인원",
+        f"{quarter_kpis['extra_headcount_needed']:,}명"
+    )
+else:
+    c5.metric("전분기 대비 증감률", "-")
+    c6.metric("추가 필요 인원", "-")
 
 st.caption(
-    f"작업일수: {kpis['작업일수']}일 / 인원-일수(worker-days): {kpis['worker_days']} / 이슈 건수: {issue_count}건"
+    f"인원-일수(worker-days): {basic_kpis['worker_days']} / 이슈 건수: {issue_count}건"
 )
 
 # =========================
@@ -610,77 +698,84 @@ with tab2:
 # 3) 인원판단
 # =========================
 with tab3:
-    st.subheader("인원 충원 판단")
+    st.subheader("인원 충원 판단 (방법 B: 증가분 ÷ 전분기 1인당 분기 처리량)")
 
-    if filtered_df.empty or filtered_long_df.empty:
-        st.info("조건에 맞는 데이터가 없습니다.")
+    quarter_summary = quarter_kpis["quarter_summary"]
+
+    if quarter_summary.empty:
+        st.info("분기 비교를 위한 데이터가 부족합니다.")
     else:
-        daily_summary = (
-            filtered_long_df.groupby("업무일자", dropna=False)["수량"]
-            .sum()
-            .reset_index()
-            .rename(columns={"수량": "총생산수량"})
+        st.write("**분기별 생산량 / 평균투입인원 / 1인당 분기 처리량**")
+        st.dataframe(
+            quarter_summary.sort_values("업무분기", key=lambda s: s.map(lambda x: pd.Period(x, freq="Q"))),
+            use_container_width=True,
+            hide_index=True,
+            height=350
         )
-
-        daily_people = (
-            filtered_df.groupby("업무일자", dropna=False)["이름"]
-            .nunique()
-            .reset_index()
-            .rename(columns={"이름": "투입인원"})
-        )
-
-        staffing_daily = daily_summary.merge(daily_people, on="업무일자", how="left")
-        staffing_daily["투입인원"] = staffing_daily["투입인원"].fillna(0)
-        staffing_daily["1인당생산량"] = staffing_daily.apply(
-            lambda x: round(x["총생산수량"] / x["투입인원"], 2) if x["투입인원"] > 0 else 0,
-            axis=1
-        )
-        staffing_daily = staffing_daily.sort_values("업무일자")
-
-        col1, col2 = st.columns(2)
-
-        with col1:
-            st.write("**날짜별 인원/생산량 요약**")
-            st.dataframe(staffing_daily, use_container_width=True, hide_index=True, height=450)
-
-        with col2:
-            st.write("**직원별 누적 생산량 / 평균 생산량**")
-            person_daily = (
-                filtered_long_df.groupby(["업무일자", "이름"], dropna=False)["수량"]
-                .sum()
-                .reset_index()
-            )
-
-            person_summary = (
-                person_daily.groupby("이름", dropna=False)["수량"]
-                .agg(["sum", "mean", "max", "count"])
-                .reset_index()
-                .rename(columns={
-                    "sum": "누적생산량",
-                    "mean": "일평균생산량",
-                    "max": "최대일생산량",
-                    "count": "작업일수"
-                })
-                .sort_values("누적생산량", ascending=False)
-            )
-
-            person_summary["일평균생산량"] = person_summary["일평균생산량"].round(2)
-
-            st.dataframe(person_summary, use_container_width=True, hide_index=True, height=450)
 
         st.markdown("---")
 
-        st.write("**판단 가이드**")
-        current_headcount = kpis["투입 인원수"]
-        required_headcount = kpis["예상 필요 인원"]
-        gap = required_headcount - current_headcount
+        if quarter_kpis["prev_quarter"] and quarter_kpis["current_quarter"]:
+            col1, col2 = st.columns(2)
 
-        if gap > 0:
-            st.warning(f"현재 기준 예상 필요 인원은 {required_headcount}명으로, 약 {gap}명 충원 검토가 필요합니다.")
-        elif gap == 0:
-            st.info(f"현재 인원 {current_headcount}명은 목표 일생산량 {target_daily_qty:,} 기준으로 적정 수준입니다.")
+            with col1:
+                compare_df = pd.DataFrame({
+                    "구분": ["전분기", "현재분기", "증가분", "증감률"],
+                    "값": [
+                        f"{quarter_kpis['prev_quarter']} / {quarter_kpis['prev_qty']:,}개",
+                        f"{quarter_kpis['current_quarter']} / {quarter_kpis['current_qty']:,}개",
+                        f"{quarter_kpis['increase_qty']:,}개",
+                        f"{quarter_kpis['growth_rate']:,}%"
+                    ]
+                })
+                st.write("**분기 비교**")
+                st.dataframe(compare_df, use_container_width=True, hide_index=True)
+
+            with col2:
+                staffing_basis_df = pd.DataFrame({
+                    "구분": ["전분기 평균투입인원", "전분기 1인당 분기 처리량", "추가 필요 인원"],
+                    "값": [
+                        quarter_kpis["prev_avg_headcount"],
+                        quarter_kpis["prev_per_person_quarter_qty"],
+                        quarter_kpis["extra_headcount_needed"]
+                    ]
+                })
+                st.write("**충원 산정 근거**")
+                st.dataframe(staffing_basis_df, use_container_width=True, hide_index=True)
+
+            st.markdown("---")
+            st.write("**판단 가이드**")
+
+            increase_qty = quarter_kpis["increase_qty"]
+            extra_headcount_needed = quarter_kpis["extra_headcount_needed"]
+
+            if increase_qty <= 0:
+                st.info(
+                    f"{quarter_kpis['prev_quarter']} 대비 {quarter_kpis['current_quarter']} 생산량이 증가하지 않아 추가 충원 필요 인원은 0명으로 계산됩니다."
+                )
+            elif quarter_kpis["prev_per_person_quarter_qty"] <= 0:
+                st.warning("전분기 1인당 분기 처리량을 계산할 수 없어 추가 필요 인원을 산정하지 못했습니다.")
+            else:
+                st.warning(
+                    f"{quarter_kpis['prev_quarter']} 대비 {quarter_kpis['current_quarter']} 생산량이 "
+                    f"{increase_qty:,}개 증가했습니다. "
+                    f"전분기 1인당 분기 처리량 {quarter_kpis['prev_per_person_quarter_qty']:,}개 기준으로 "
+                    f"약 {extra_headcount_needed}명 추가 충원 검토가 필요합니다."
+                )
+
+            formula_df = pd.DataFrame({
+                "항목": ["증가분", "전분기 1인당 분기 처리량", "추가 필요 인원 계산식"],
+                "내용": [
+                    f"{quarter_kpis['current_qty']:,} - {quarter_kpis['prev_qty']:,} = {quarter_kpis['increase_qty']:,}",
+                    f"{quarter_kpis['prev_qty']:,} ÷ {quarter_kpis['prev_avg_headcount']:,}" if quarter_kpis["prev_avg_headcount"] > 0 else "-",
+                    f"{quarter_kpis['increase_qty']:,} ÷ {quarter_kpis['prev_per_person_quarter_qty']:,} → 올림 = {quarter_kpis['extra_headcount_needed']}명" if quarter_kpis["prev_per_person_quarter_qty"] > 0 else "-"
+                ]
+            })
+            st.write("**계산식 요약**")
+            st.dataframe(formula_df, use_container_width=True, hide_index=True)
+
         else:
-            st.success(f"현재 인원 {current_headcount}명은 목표 대비 여유가 있습니다. (예상 필요 인원: {required_headcount}명)")
+            st.info("최소 2개 분기의 데이터가 있어야 충원 판단이 가능합니다.")
 
 
 # =========================
@@ -691,7 +786,7 @@ with tab4:
 
     display_cols = [
         c for c in [
-            "업무일자", "이름", "부서", "작성일시",
+            "업무일자", "업무분기", "이름", "부서", "작성일시",
             "입고수량", "출고수량", "반품수량",
             "총생산수량",
             "재고확인사항", "배송이슈",
@@ -729,7 +824,7 @@ with tab5:
 
     issue_cols = [
         c for c in [
-            "업무일자", "이름", "부서",
+            "업무일자", "업무분기", "이름", "부서",
             "재고확인사항", "배송이슈", "미처리내역",
             "특이사항", "Comment",
             "오전 업무내용", "오후 업무내용",
